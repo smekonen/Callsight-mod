@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { Graph } from '@codeflow-map/core';
-import { checkGitAvailable, validateCommitHash, computeFullGitDiff, analyzeFilePath } from '../extension';
+import { checkGitAvailable, validateCommitHash, computeFullGitDiff, analyzeFilePath, resolveWorkspacePath } from '../extension';
 import { initTreeSitter } from '@codeflow-map/core';
 import { extractLeadingFunctionComment, FunctionComment } from '../functionComments';
 
@@ -147,11 +147,10 @@ function attachMessageHandler(context: vscode.ExtensionContext) {
         nodesByFile.set(node.filePath, group);
       }
 
-      const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
       const sources: Array<{ id: string; source: string; comment?: FunctionComment }> = [];
       await Promise.all([...nodesByFile.entries()].map(async ([filePath, nodes]) => {
         try {
-          const absolutePath = path.isAbsolute(filePath) ? filePath : path.join(workspaceRoot, filePath);
+          const absolutePath = resolveWorkspacePath(filePath);
           const document = await vscode.workspace.openTextDocument(vscode.Uri.file(absolutePath));
           const documentText = document.getText();
           for (const node of nodes) {
@@ -184,8 +183,7 @@ function attachMessageHandler(context: vscode.ExtensionContext) {
     }
 
     if (msg.type === 'GOTO_FUNCTION') {
-      const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
-      const uri = vscode.Uri.file(path.join(workspaceFolder, msg.filePath));
+      const uri = vscode.Uri.file(resolveWorkspacePath(msg.filePath));
       vscode.window.showTextDocument(uri, {
         selection: new vscode.Range(msg.startLine, 0, msg.startLine, 0),
         preserveFocus: false,

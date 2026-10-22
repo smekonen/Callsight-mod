@@ -335,8 +335,7 @@ export async function analyzeFilePath(relPath: string, wasmDir: string) {
       treeSitterInitialized = true;
     }
 
-    const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
-    const absPath = path.join(workspaceFolder, relPath);
+    const absPath = resolveWorkspacePath(relPath);
     const languageId = FILE_EXTENSION_MAP[path.extname(absPath)];
     if (!languageId) {
       vscode.window.showErrorMessage('CallSight: Unsupported file type.');
@@ -429,6 +428,21 @@ export async function validateCommitHash(hash: string): Promise<{ valid: boolean
   } catch {
     return { valid: false, reason: `"${hash}" is not a valid Git object` };
   }
+}
+
+/**
+ * Map a scan path back to disk. In multi-root workspaces asRelativePath
+ * prefixes paths with the workspace folder name, so strip and resolve that.
+ */
+export function resolveWorkspacePath(filePath: string): string {
+  if (path.isAbsolute(filePath)) return filePath;
+  const folders = vscode.workspace.workspaceFolders || [];
+  if (folders.length > 1) {
+    const [first, ...rest] = filePath.split('/');
+    const folder = folders.find(f => f.name === first);
+    if (folder && rest.length > 0) return path.join(folder.uri.fsPath, ...rest);
+  }
+  return path.join(folders[0]?.uri.fsPath || '', filePath);
 }
 
 function detectLanguage(filePath: string): SupportedLanguage | null {
