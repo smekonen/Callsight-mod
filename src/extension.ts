@@ -3,16 +3,33 @@ import * as cp from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { minimatch } from 'minimatch';
-import { parseFile, parseFileContent, buildCallGraph, detectEntryPoints, partitionFlows, initTreeSitter, FunctionNode, CallEdge, DiffGraph, NodeDiffStatus, EdgeDiffStatus, FILE_EXTENSION_MAP, SupportedLanguage, Logger } from '@codeflow-map/core';
+import { parseFile, parseFileContent, detectEntryPoints, partitionFlows, initTreeSitter, FunctionNode, CallEdge, DiffGraph, NodeDiffStatus, EdgeDiffStatus, FILE_EXTENSION_MAP, SupportedLanguage, Logger } from '@codeflow-map/core';
 import { openCallSightPanel, ensurePanel, currentPanel, revealLastResult, hasLastResult } from './webview/panel';
+import { buildEnhancedCallGraph as buildCallGraph } from './graphEnhancements';
+import { enrichExternalSignatures } from './signatureEnrichment';
+import { GitLineDiffMap, parseGitUnifiedDiff } from './gitLineDiff';
+import { extractLeadingFunctionComment, FunctionComment } from './functionComments';
 
 let treeSitterInitialized = false;
 let outputChannel: vscode.OutputChannel;
 
 const DEFAULT_SCAN_BATCH_SIZE = 50;
+const DEFAULT_SIGNATURE_TIMEOUT_SECONDS = 5;
 
 function getScanBatchSize(): number {
   return vscode.workspace.getConfiguration('callsight').get<number>('scanBatchSize') || DEFAULT_SCAN_BATCH_SIZE;
+}
+
+function normalizeSignatureTimeoutSeconds(value?: number): number {
+  const seconds = typeof value === 'number' && Number.isFinite(value)
+    ? value
+    : DEFAULT_SIGNATURE_TIMEOUT_SECONDS;
+  return Math.min(60, Math.max(1, Math.round(seconds)));
+}
+
+function getSignatureTimeoutMs(value?: number): number {
+  const seconds = normalizeSignatureTimeoutSeconds(value);
+  return Math.min(60, Math.max(1, seconds)) * 1_000;
 }
 
 /** Rough byte-size estimate without serialising the entire graph. */
@@ -39,6 +56,28 @@ const DISCOVERY_EXCLUDES = [
   '**/out/**', '**/bin/**', '**/obj/**', '**/tests/**', '**/__tests__/**', '**/spec/**', '**/__specs__/**','**/test/**', '**/spec/**'
 ];
 
+class CallSightActionProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
+  getTreeItem(item: vscode.TreeItem): vscode.TreeItem {
+    return item;
+  }
+
+  getChildren(): vscode.TreeItem[] {
+    return [
+      this.action('Open CallSight', 'callsight.launch', 'graph', 'Open the latest visualization or scan the workspace'),
+      this.action('Visualize Workspace', 'callsight.analyzeWorkspace', 'project', 'Scan and visualize the entire workspace'),
+      this.action('Visualize Current File', 'callsight.analyzeCurrentFile', 'file-code', 'Scan and visualize the active file'),
+    ];
+  }
+
+  private action(label: string, command: string, icon: string, tooltip: string): vscode.TreeItem {
+    const item = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.None);
+    item.command = { command, title: label };
+    item.iconPath = new vscode.ThemeIcon(icon);
+    item.tooltip = tooltip;
+    return item;
+  }
+}
+
 export async function activate(context: vscode.ExtensionContext) {
   outputChannel = vscode.window.createOutputChannel('CallSight');
   context.subscriptions.push(outputChannel);
@@ -57,11 +96,30 @@ export async function activate(context: vscode.ExtensionContext) {
       analyzeWorkspace();
     }
   });
-
-  context.subscriptions.push(analyzeWorkspaceCmd, analyzeCurrentFileCmd, launchCmd);
-
-  async function analyzeWorkspace() {
+  const sidebarView = vscode.window.createTreeView('callsight.sidebar', {
+    treeDataProvider: new CallSightActionProvider(),
+  });
+  let sidebarLaunchInProgress = false;
+  const launchFromSidebar = async () => {
+    if (sidebarLaunchInProgress) return;
+    sidebarLaunchInProgress = true;
     try {
+      await vscode.commands.executeCommand('workbench.action.closeSidebar');
+      await vscode.commands.executeCommand('callsight.analyzeWorkspace');
+    } finally {
+      sidebarLaunchInProgress = false;
+    }
+  };
+  const sidebarVisibility = sidebarView.onDidChangeVisibility(event => {
+    if (event.visible) void launchFromSidebar();
+  });
+  if (sidebarView.visible) void launchFromSidebar();
+
+  context.subscriptions.push(analyzeWorkspaceCmd, analyzeCurrentFileCmd, launchCmd, sidebarView, sidebarVisibility);
+
+  async function analyzeWorkspace(options?: { signatureTimeoutSeconds?: number }) {
+    try {
+      const signatureTimeoutSeconds = normalizeSignatureTimeoutSeconds(options?.signatureTimeoutSeconds);
       const wasmDir = vscode.Uri.joinPath(context.extensionUri, 'grammars').fsPath;
       if (!treeSitterInitialized) {
         log('Initializing Tree-sitter...');
@@ -155,6 +213,13 @@ export async function activate(context: vscode.ExtensionContext) {
           
           log('Starting buildCallGraph...');
           const edges = buildCallGraph(allFunctions, allCalls, log);
+          await enrichExternalSignatures(
+            allFunctions,
+            edges,
+            new Map(filesToScan.map(file => [file.filePath, vscode.Uri.file(file.absPath)])),
+            getSignatureTimeoutMs(signatureTimeoutSeconds),
+            log,
+          );
           log(`buildCallGraph complete: ${edges.length} edges in ${Date.now() - scanDoneTime}ms`);
 
           log('Starting detectEntryPoints...');
@@ -173,13 +238,14 @@ export async function activate(context: vscode.ExtensionContext) {
             flows,
             orphans,
             scannedFiles,
-            durationMs: Date.now() - startTime
+            durationMs: Date.now() - startTime,
+            sourceDiffs: await getWorkingTreeLineDiffs(log),
           };
 
           const graphPayloadSize = estimateGraphSize(graph);
           log(`Graph payload: ${graph.nodes.length} nodes, ${graph.edges.length} edges, ${graph.flows.length} flows, ${graph.orphans.length} orphans, ~${(graphPayloadSize / 1024 / 1024).toFixed(1)}MB est.`);
           log('Posting graph to webview...');
-          openCallSightPanel(context, graph, wasmDir, 'workspace');
+          openCallSightPanel(context, graph, wasmDir, 'workspace', signatureTimeoutSeconds);
           log(`Graph posted to webview (${Date.now() - graphBuildTime}ms)`);
           log(`=== Workspace analysis complete: ${((Date.now() - startTime) / 1000).toFixed(1)}s total ===`);
           outputChannel.show(true);
@@ -231,6 +297,13 @@ export async function activate(context: vscode.ExtensionContext) {
           const { functions, calls } = await parseFile(filePath, absPath, wasmDir, languageId);
           
           const edges = buildCallGraph(functions, calls, log);
+          await enrichExternalSignatures(
+            functions,
+            edges,
+            new Map([[filePath, editor.document.uri]]),
+            getSignatureTimeoutMs(),
+            log,
+          );
           detectEntryPoints(functions, edges, log);
           const { flows, orphans } = partitionFlows(functions, edges, log);
 
@@ -240,10 +313,11 @@ export async function activate(context: vscode.ExtensionContext) {
             flows,
             orphans,
             scannedFiles: 1,
-            durationMs: Date.now() - startTime
+            durationMs: Date.now() - startTime,
+            sourceDiffs: await getWorkingTreeLineDiffs(log),
           };
 
-          openCallSightPanel(context, graph, wasmDir, 'file');
+          openCallSightPanel(context, graph, wasmDir, 'file', DEFAULT_SIGNATURE_TIMEOUT_SECONDS);
         }
       );
     } catch (e: any) {
@@ -272,6 +346,12 @@ export async function analyzeFilePath(relPath: string, wasmDir: string) {
     const startTime = Date.now();
     const { functions, calls } = await parseFile(relPath, absPath, wasmDir, languageId);
     const edges = buildCallGraph(functions, calls);
+    await enrichExternalSignatures(
+      functions,
+      edges,
+      new Map([[relPath, vscode.Uri.file(absPath)]]),
+      getSignatureTimeoutMs(),
+    );
     detectEntryPoints(functions, edges);
     const { flows, orphans } = partitionFlows(functions, edges);
 
@@ -281,14 +361,20 @@ export async function analyzeFilePath(relPath: string, wasmDir: string) {
       flows,
       orphans,
       scannedFiles: 1,
-      durationMs: Date.now() - startTime
+      durationMs: Date.now() - startTime,
+      sourceDiffs: await getWorkingTreeLineDiffs(),
     };
 
     const config = vscode.workspace.getConfiguration('callsight');
     const blacklist = config.get<string[]>('exclude') || [
       "node_modules", "dist", "build", ".git", "__pycache__", "*.test.*", "*.spec.*"
     ];
-    currentPanel?.webview.postMessage({ type: 'LOAD_GRAPH', graph, callsightConfig: { blacklist }, mode: 'file' });
+    currentPanel?.webview.postMessage({
+      type: 'LOAD_GRAPH',
+      graph,
+      callsightConfig: { blacklist, signatureTimeoutSeconds: DEFAULT_SIGNATURE_TIMEOUT_SECONDS },
+      mode: 'file',
+    });
   } catch (e: any) {
     vscode.window.showErrorMessage('CallSight Refresh Failed: ' + e.message);
   }
@@ -298,11 +384,28 @@ export async function analyzeFilePath(relPath: string, wasmDir: string) {
 
 function execGit(cwd: string, args: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    cp.exec(`git ${args}`, { cwd, maxBuffer: 10 * 1024 * 1024 }, (err, stdout) => {
+    cp.exec(`git ${args}`, { cwd, maxBuffer: 50 * 1024 * 1024 }, (err, stdout) => {
       if (err) reject(err);
       else resolve(stdout);
     });
   });
+}
+
+const PATCH_FLAGS = 'diff --no-color --no-ext-diff --no-textconv --find-renames --unified=0';
+
+async function getWorkingTreeLineDiffs(log?: Logger): Promise<GitLineDiffMap> {
+  const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  if (!workspaceFolder) return {};
+  try {
+    const patch = await execGit(workspaceFolder, `${PATCH_FLAGS} HEAD -- .`);
+    const parsed = parseGitUnifiedDiff(patch);
+    log?.(`Git source diff: ${Object.keys(parsed).length} changed files`);
+    return parsed;
+  } catch (error: any) {
+    // Non-Git folders and repositories without an initial commit still analyze normally.
+    log?.(`Git source diff unavailable: ${error?.message || String(error)}`);
+    return {};
+  }
 }
 
 export async function checkGitAvailable(): Promise<{ available: boolean; reason?: string }> {
@@ -367,7 +470,20 @@ export async function computeFullGitDiff(
     diffCmd = `diff --name-status ${refA} ${refB}`;
   }
 
-  const diffOutput = await execGit(workspaceFolder, diffCmd);
+  let patchCmd: string;
+  if (isUncommittedMode) {
+    patchCmd = `${PATCH_FLAGS} HEAD -- .`;
+  } else if (!hashB) {
+    patchCmd = `${PATCH_FLAGS} ${refA} HEAD -- .`;
+  } else {
+    patchCmd = `${PATCH_FLAGS} ${refA} ${refB} -- .`;
+  }
+
+  const [diffOutput, patchOutput] = await Promise.all([
+    execGit(workspaceFolder, diffCmd),
+    execGit(workspaceFolder, patchCmd),
+  ]);
+  const sourceDiffs = parseGitUnifiedDiff(patchOutput);
   const diffLines = diffOutput.trim().split('\n').filter(l => l.length > 0);
 
   if (diffLines.length === 0) throw new Error('No differences found between the specified versions');
@@ -395,6 +511,7 @@ export async function computeFullGitDiff(
   sendProgress(`Analyzing version A (${refA})... (${supportedDiffFiles.length} files)`);
   const aFunctions: FunctionNode[] = [];
   const aCalls: any[] = [];
+  const aFileContents = new Map<string, string>();
 
   const aFiles = supportedDiffFiles.filter(df => {
     if (df.status === 'A') return false;
@@ -410,14 +527,22 @@ export async function computeFullGitDiff(
         const showPath = (df.oldPath || df.filePath).replace(/\\/g, '/');
         try {
           const content = await execGit(workspaceFolder, `show ${refA}:${showPath}`);
-          return await parseFileContent(df.filePath, content, wasmDir, lang);
+          return {
+            filePath: df.filePath,
+            content,
+            parsed: await parseFileContent(df.filePath, content, wasmDir, lang),
+          };
         } catch {
           return null; // File might not exist at refA
         }
       })
     );
-    for (const r of results) {
-      if (r) { aFunctions.push(...r.functions); aCalls.push(...r.calls); }
+    for (const result of results) {
+      if (result) {
+        aFileContents.set(result.filePath, result.content);
+        aFunctions.push(...result.parsed.functions);
+        aCalls.push(...result.parsed.calls);
+      }
     }
     sendProgress(`Analyzing version A (${refA})... ${Math.min(i + batchSize, aFiles.length)}/${aFiles.length} files`);
   }
@@ -430,6 +555,7 @@ export async function computeFullGitDiff(
   sendProgress(`Analyzing version B (${refBLabel})... (${supportedDiffFiles.length} files)`);
   const bFunctions: FunctionNode[] = [];
   const bCalls: any[] = [];
+  const bFileContents = new Map<string, string>();
 
   const bFiles = supportedDiffFiles.filter(df => {
     if (df.status === 'D') return false;
@@ -449,14 +575,22 @@ export async function computeFullGitDiff(
             const showRef = refB || 'HEAD';
             content = await execGit(workspaceFolder, `show ${showRef}:${df.filePath.replace(/\\/g, '/')}`);
           }
-          return await parseFileContent(df.filePath, content, wasmDir, lang);
+          return {
+            filePath: df.filePath,
+            content,
+            parsed: await parseFileContent(df.filePath, content, wasmDir, lang),
+          };
         } catch {
           return null; // File might not exist at refB
         }
       })
     );
-    for (const r of results) {
-      if (r) { bFunctions.push(...r.functions); bCalls.push(...r.calls); }
+    for (const result of results) {
+      if (result) {
+        bFileContents.set(result.filePath, result.content);
+        bFunctions.push(...result.parsed.functions);
+        bCalls.push(...result.parsed.calls);
+      }
     }
     sendProgress(`Analyzing version B (${refBLabel})... ${Math.min(i + batchSize, bFiles.length)}/${bFiles.length} files`);
   }
@@ -504,7 +638,12 @@ export async function computeFullGitDiff(
         aIdToMergedId.set(aNode.id, bNode.id);
         const paramsChanged = JSON.stringify(aNode.params) !== JSON.stringify(bNode.params);
         const returnChanged = aNode.returnType !== bNode.returnType;
-        nodeDiffStatus[bNode.id] = (paramsChanged || returnChanged) ? 'changed' : 'unchanged';
+        const aContent = aFileContents.get(aNode.filePath);
+        const bContent = bFileContents.get(bNode.filePath);
+        const aSource = aContent === undefined ? undefined : sliceFunctionSource(aContent, aNode);
+        const bSource = bContent === undefined ? undefined : sliceFunctionSource(bContent, bNode);
+        const sourceChanged = aSource !== undefined && bSource !== undefined && aSource !== bSource;
+        nodeDiffStatus[bNode.id] = (paramsChanged || returnChanged || sourceChanged) ? 'changed' : 'unchanged';
       } else {
         nodeDiffStatus[bNode.id] = 'added';
       }
@@ -634,6 +773,17 @@ export async function computeFullGitDiff(
   const finalNodes = mergedNodes.filter(n => includedNodeIds.has(n.id));
   const finalEdges = mergedEdges.filter(e => includedNodeIds.has(e.from) && includedNodeIds.has(e.to));
 
+  const functionSources: Record<string, string> = {};
+  const functionComments: Record<string, FunctionComment> = {};
+  for (const node of finalNodes) {
+    const content = (nodeDiffStatus[node.id] === 'removed' ? aFileContents : bFileContents).get(node.filePath);
+    if (content !== undefined) {
+      functionSources[node.id] = sliceFunctionSource(content, node);
+      const comment = extractLeadingFunctionComment(content, node);
+      if (comment) functionComments[node.id] = comment;
+    }
+  }
+
   const diffGraph: DiffGraph = {
     nodes: finalNodes,
     edges: finalEdges,
@@ -647,5 +797,16 @@ export async function computeFullGitDiff(
     isDiffMode: true,
   };
 
+  (diffGraph as any).sourceDiffs = sourceDiffs;
+  (diffGraph as any).functionSources = functionSources;
+  (diffGraph as any).functionComments = functionComments;
+
   return diffGraph;
+}
+
+function sliceFunctionSource(content: string, node: FunctionNode): string {
+  const lines = content.split(/\r?\n/);
+  const startLine = Math.min(Math.max(0, node.startLine), Math.max(0, lines.length - 1));
+  const endLine = Math.min(Math.max(startLine, node.endLine), Math.max(0, lines.length - 1));
+  return lines.slice(startLine, endLine + 1).join('\n');
 }

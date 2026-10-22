@@ -1,0 +1,577 @@
+diff --git a/dist/analyzer/index.js b/dist/analyzer/index.js
+index a31117c88a8a820be99ae4939d0fecfc6a3bb2dd..83c3f45b0d52dd2c851a8cd6bbbbcf31c323ae64 100644
+--- a/dist/analyzer/index.js
++++ b/dist/analyzer/index.js
+@@ -48,13 +48,14 @@ const tsx_1 = require("./languages/tsx");
+ const jsx_1 = require("./languages/jsx");
+ const go_1 = require("./languages/go");
+ const python_1 = require("./languages/python");
++const java_1 = require("./languages/java");
+ const ANALYZERS = {
+     typescript: typescript_1.typescriptAnalyzer,
+     tsx: tsx_1.tsxAnalyzer,
+     javascript: javascript_1.javascriptAnalyzer,
+     jsx: jsx_1.jsxAnalyzer,
+     python: python_1.pythonAnalyzer,
+-    java: null,
++    java: java_1.javaAnalyzer,
+     go: go_1.goAnalyzer,
+     rust: null
+ };
+diff --git a/dist/analyzer/languages/java.d.ts b/dist/analyzer/languages/java.d.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..ee6f49b92b46479c8033c249462dae2ee9396af4
+--- /dev/null
++++ b/dist/analyzer/languages/java.d.ts
+@@ -0,0 +1,2 @@
++import { LanguageAnalyzer } from '../../types';
++export declare const javaAnalyzer: LanguageAnalyzer;
+diff --git a/dist/analyzer/languages/java.js b/dist/analyzer/languages/java.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..41fb9fa7d17a79a06d5455d0eb81cf72c6845357
+--- /dev/null
++++ b/dist/analyzer/languages/java.js
+@@ -0,0 +1,452 @@
++"use strict";
++Object.defineProperty(exports, "__esModule", { value: true });
++exports.javaAnalyzer = void 0;
++/**
++ * Java analyzer. Methods are named `Owner.method`, constructors `new Owner`.
++ * Calls carry extra `java*` fields (receiver type candidates, method name,
++ * argument count) which the extension's Java resolver uses to handle
++ * overloads, inheritance and interface dispatch.
++ */
++const TYPE_DECL_TYPES = ['class_declaration', 'interface_declaration', 'enum_declaration', 'record_declaration', 'annotation_type_declaration'];
++const SCOPE_BODY_TYPES = ['block', 'constructor_body', 'switch_block_statement_group', 'switch_rule'];
++const CLASS_BODY_TYPES = ['class_body', 'interface_body', 'enum_body_declarations', 'annotation_type_body'];
++/** `java.util.List<Foo>[]` -> `List` */
++function simpleType(text) {
++    if (!text)
++        return null;
++    let t = text.replace(/@[\w.]+(\([^)]*\))?\s*/g, '');
++    let prev;
++    do {
++        prev = t;
++        t = t.replace(/<[^<>]*>/g, '');
++    } while (t !== prev);
++    t = t.replace(/\[\s*\]/g, '').replace(/\.\.\./g, '').trim();
++    const dot = t.lastIndexOf('.');
++    if (dot >= 0)
++        t = t.substring(dot + 1);
++    return t || null;
++}
++function isAnonymousClassBody(node) {
++    return node.type === 'class_body' && node.parent?.type === 'object_creation_expression';
++}
++/** Name of a type declaration or anonymous class body. */
++function typeNameOf(node) {
++    if (TYPE_DECL_TYPES.includes(node.type))
++        return node.childForFieldName('name')?.text ?? null;
++    if (isAnonymousClassBody(node)) {
++        const created = simpleType(node.parent.childForFieldName('type')?.text);
++        const outer = getEnclosingTypes(node.parent)[0];
++        return outer ? `${outer}$${created}` : `$${created}`;
++    }
++    return null;
++}
++/** Enclosing type names, innermost first. */
++function getEnclosingTypes(node) {
++    const types = [];
++    let current = node.parent;
++    while (current) {
++        if (TYPE_DECL_TYPES.includes(current.type) || isAnonymousClassBody(current)) {
++            const name = typeNameOf(current);
++            if (name)
++                types.push(name);
++        }
++        current = current.parent;
++    }
++    return types;
++}
++function getEnclosingTypeDecl(node) {
++    let current = node.parent;
++    while (current) {
++        if (TYPE_DECL_TYPES.includes(current.type) || isAnonymousClassBody(current))
++            return current;
++        current = current.parent;
++    }
++    return null;
++}
++/** Direct supertypes (simple names) of a type declaration or anonymous class body. */
++function getSupertypes(typeDecl) {
++    if (!typeDecl)
++        return [];
++    if (isAnonymousClassBody(typeDecl)) {
++        const t = simpleType(typeDecl.parent.childForFieldName('type')?.text);
++        return t ? [t] : [];
++    }
++    const result = [];
++    const collect = (n) => {
++        if (!n)
++            return;
++        for (const child of n.namedChildren) {
++            if (child.type === 'type_list') {
++                collect(child);
++            }
++            else {
++                const t = simpleType(child.text);
++                if (t)
++                    result.push(t);
++            }
++        }
++    };
++    collect(typeDecl.childForFieldName('superclass'));
++    collect(typeDecl.childForFieldName('interfaces'));
++    for (const child of typeDecl.namedChildren) {
++        if (child.type === 'extends_interfaces')
++            collect(child);
++    }
++    return Array.from(new Set(result));
++}
++function declaratorsOf(decl) {
++    return decl.namedChildren.filter((c) => c.type === 'variable_declarator');
++}
++/** Declared type of a variable declaration, resolving `var x = new Foo()`. */
++function declaredType(typeNode, declarator) {
++    const t = simpleType(typeNode?.text);
++    if (t !== 'var')
++        return t;
++    const value = declarator?.childForFieldName('value');
++    if (value?.type === 'object_creation_expression')
++        return simpleType(value.childForFieldName('type')?.text);
++    if (value?.type === 'cast_expression')
++        return simpleType(value.childForFieldName('type')?.text);
++    return null;
++}
++function findInParams(paramsNode, name) {
++    if (!paramsNode)
++        return undefined;
++    for (const p of paramsNode.namedChildren) {
++        if (p.type === 'formal_parameter' && p.childForFieldName('name')?.text === name) {
++            return simpleType(p.childForFieldName('type')?.text);
++        }
++        if (p.type === 'spread_parameter') {
++            const decl = p.namedChildren.find((c) => c.type === 'variable_declarator');
++            if (decl?.childForFieldName('name')?.text === name)
++                return null; // array; methods on it are not workspace calls
++        }
++        if (p.type === 'identifier' && p.text === name)
++            return null; // inferred lambda param
++    }
++    return undefined;
++}
++function findFieldInTypeBody(body, name) {
++    for (const child of body.namedChildren) {
++        if (child.type === 'field_declaration' || child.type === 'constant_declaration') {
++            const decl = declaratorsOf(child).find((d) => d.childForFieldName('name')?.text === name);
++            if (decl)
++                return declaredType(child.childForFieldName('type'), decl);
++        }
++        if (child.type === 'enum_body_declarations') {
++            const t = findFieldInTypeBody(child, name);
++            if (t !== undefined)
++                return t;
++        }
++    }
++    const owner = body.parent;
++    if (owner?.type === 'record_declaration') {
++        return findInParams(owner.childForFieldName('parameters'), name);
++    }
++    return undefined;
++}
++/**
++ * Resolve the declared type of a variable visible from `node`.
++ * Returns undefined when not found, null when found but the type is unknown.
++ */
++function resolveVariableType(node, name) {
++    let current = node.parent;
++    let child = node;
++    while (current) {
++        const t = current.type;
++        if (SCOPE_BODY_TYPES.includes(t)) {
++            for (const stmt of current.namedChildren) {
++                if (stmt.startIndex >= child.startIndex)
++                    break;
++                if (stmt.type === 'local_variable_declaration') {
++                    const decl = declaratorsOf(stmt).find((d) => d.childForFieldName('name')?.text === name);
++                    if (decl)
++                        return declaredType(stmt.childForFieldName('type'), decl);
++                }
++            }
++        }
++        else if (t === 'enhanced_for_statement') {
++            if (current.childForFieldName('name')?.text === name)
++                return simpleType(current.childForFieldName('type')?.text);
++        }
++        else if (t === 'for_statement') {
++            const init = current.childForFieldName('init');
++            if (init?.type === 'local_variable_declaration') {
++                const decl = declaratorsOf(init).find((d) => d.childForFieldName('name')?.text === name);
++                if (decl)
++                    return declaredType(init.childForFieldName('type'), decl);
++            }
++        }
++        else if (t === 'catch_clause') {
++            const param = current.namedChildren.find((c) => c.type === 'catch_formal_parameter');
++            if (param?.childForFieldName('name')?.text === name) {
++                const catchType = param.namedChildren.find((c) => c.type === 'catch_type');
++                return simpleType(catchType?.namedChildren[0]?.text);
++            }
++        }
++        else if (t === 'try_with_resources_statement') {
++            const spec = current.childForFieldName('resources');
++            for (const res of spec?.namedChildren ?? []) {
++                if (res.type === 'resource' && res.childForFieldName('name')?.text === name) {
++                    const typeNode = res.childForFieldName('type');
++                    if (simpleType(typeNode?.text) === 'var') {
++                        const value = res.childForFieldName('value');
++                        return value?.type === 'object_creation_expression' ? simpleType(value.childForFieldName('type')?.text) : null;
++                    }
++                    return simpleType(typeNode?.text);
++                }
++            }
++        }
++        else if (t === 'method_declaration' || t === 'constructor_declaration' || t === 'lambda_expression') {
++            const params = current.childForFieldName('parameters');
++            if (params?.type === 'identifier') {
++                if (params.text === name)
++                    return null;
++            }
++            else {
++                const found = findInParams(params, name);
++                if (found !== undefined)
++                    return found;
++            }
++        }
++        else if (t === 'compact_constructor_declaration') {
++            const record = getEnclosingTypeDecl(current);
++            const found = findInParams(record?.childForFieldName('parameters'), name);
++            if (found !== undefined)
++                return found;
++        }
++        else if (CLASS_BODY_TYPES.includes(t) || t === 'class_body' || t === 'enum_body') {
++            const found = findFieldInTypeBody(current, name);
++            if (found !== undefined)
++                return found;
++        }
++        child = current;
++        current = current.parent;
++    }
++    return undefined;
++}
++function hasModifier(decl, modifier) {
++    const mods = decl.namedChildren.find((c) => c.type === 'modifiers');
++    return !!mods && mods.children.some((c) => c.type === modifier || c.text === modifier);
++}
++function countArgs(argsNode) {
++    return argsNode ? argsNode.namedChildren.filter((c) => c.type !== 'line_comment' && c.type !== 'block_comment').length : -1;
++}
++/**
++ * Candidate receiver types for an object expression, or null when unknown.
++ * `[]` means "implicit this" and is filled in by the caller.
++ */
++function receiverTypes(objectNode, ownerTypes, ownerDecl) {
++    if (!objectNode)
++        return ownerTypes;
++    switch (objectNode.type) {
++        case 'this':
++            return ownerTypes.slice(0, 1);
++        case 'super':
++            return getSupertypes(ownerDecl);
++        case 'identifier': {
++            const t = resolveVariableType(objectNode, objectNode.text);
++            if (t !== undefined)
++                return t ? [t] : null;
++            // Not a variable: probably a static call on a class (Util.foo()).
++            return /^[A-Z]/.test(objectNode.text) ? [objectNode.text] : null;
++        }
++        case 'field_access': {
++            const obj = objectNode.childForFieldName('object');
++            const field = objectNode.childForFieldName('field');
++            if (obj?.type === 'this' && field) {
++                const t = resolveVariableType(objectNode, field.text);
++                return t ? [t] : null;
++            }
++            // Fully qualified static call: com.foo.Util.bar()
++            if (field && /^[A-Z]/.test(field.text) && /^[a-z]/.test(objectNode.text))
++                return [field.text];
++            return null;
++        }
++        case 'scoped_identifier':
++        case 'type_identifier':
++        case 'generic_type':
++            return [simpleType(objectNode.text)];
++        case 'object_creation_expression':
++            return [simpleType(objectNode.childForFieldName('type')?.text)];
++        case 'parenthesized_expression': {
++            const inner = objectNode.namedChildren[0];
++            if (inner?.type === 'cast_expression')
++                return [simpleType(inner.childForFieldName('type')?.text)];
++            return null;
++        }
++        default:
++            return null;
++    }
++}
++exports.javaAnalyzer = {
++    functionQuery: `
++(method_declaration
++  name: (identifier) @fn.name
++  parameters: (formal_parameters) @fn.params) @fn.decl
++
++(constructor_declaration
++  name: (identifier) @fn.name
++  parameters: (formal_parameters) @fn.params) @fn.decl
++
++(compact_constructor_declaration
++  name: (identifier) @fn.name) @fn.decl
++  `,
++    callQuery: `
++(method_invocation
++  name: (identifier) @call.name
++  arguments: (argument_list) @call.args) @call.expr
++
++(object_creation_expression
++  type: (_) @call.name
++  arguments: (argument_list) @call.args) @call.expr
++
++(explicit_constructor_invocation
++  arguments: (argument_list) @call.args) @call.expr
++
++(method_reference) @call.expr
++  `,
++    extractFunction(match, filePath, languageId) {
++        const declCapture = match.captures.find((c) => c.name === 'fn.decl');
++        const nameCapture = match.captures.find((c) => c.name === 'fn.name');
++        if (!declCapture || !nameCapture)
++            return null;
++        const decl = declCapture.node;
++        const ownerDecl = getEnclosingTypeDecl(decl);
++        const enclosingTypes = getEnclosingTypes(decl);
++        const owner = enclosingTypes[0] ?? null;
++        const isConstructor = decl.type !== 'method_declaration';
++        const methodName = nameCapture.node.text;
++        const fnName = isConstructor
++            ? `new ${owner ?? methodName}`
++            : owner ? `${owner}.${methodName}` : methodName;
++        let paramsNode = match.captures.find((c) => c.name === 'fn.params')?.node;
++        if (decl.type === 'compact_constructor_declaration')
++            paramsNode = ownerDecl?.childForFieldName('parameters');
++        const params = [];
++        let isVarArgs = false;
++        for (const p of paramsNode?.namedChildren ?? []) {
++            if (p.type === 'formal_parameter') {
++                params.push({ name: p.childForFieldName('name')?.text ?? p.text, type: p.childForFieldName('type')?.text ?? null });
++            }
++            else if (p.type === 'spread_parameter') {
++                isVarArgs = true;
++                const typeNode = p.namedChildren.find((c) => c.type !== 'variable_declarator' && c.type !== 'modifiers');
++                const nameNode = p.namedChildren.find((c) => c.type === 'variable_declarator')?.childForFieldName('name');
++                params.push({ name: nameNode?.text ?? p.text, type: typeNode ? `${typeNode.text}...` : null });
++            }
++        }
++        const isAbstract = !decl.childForFieldName('body');
++        const isStatic = hasModifier(decl, 'static');
++        const inInterface = ownerDecl?.type === 'interface_declaration';
++        const isExported = hasModifier(decl, 'public') || inInterface;
++        const isMain = !isConstructor && methodName === 'main' && isStatic && params.length === 1;
++        return {
++            id: `${filePath}::${fnName}::${decl.startPosition.row}`,
++            name: fnName,
++            filePath,
++            startLine: decl.startPosition.row,
++            endLine: decl.endPosition.row,
++            params,
++            returnType: isConstructor ? owner : (decl.childForFieldName('type')?.text ?? null),
++            isAsync: false,
++            isExported,
++            isEntryPoint: isMain,
++            language: languageId,
++            kind: 'method',
++            javaOwner: owner,
++            javaMethodName: isConstructor ? '<init>' : methodName,
++            javaSupertypes: getSupertypes(ownerDecl),
++            javaIsAnonymous: !!ownerDecl && isAnonymousClassBody(ownerDecl),
++            javaIsAbstract: isAbstract,
++            javaIsStatic: isStatic,
++            javaIsVarArgs: isVarArgs,
++        };
++    },
++    extractCall(match, filePath) {
++        const exprCapture = match.captures.find((c) => c.name === 'call.expr');
++        if (!exprCapture)
++            return null;
++        const expr = exprCapture.node;
++        const nameNode = match.captures.find((c) => c.name === 'call.name')?.node;
++        const argsNode = match.captures.find((c) => c.name === 'call.args')?.node;
++        const ownerDecl = getEnclosingTypeDecl(expr);
++        const ownerTypes = getEnclosingTypes(expr);
++        const base = {
++            callerFilePath: filePath,
++            line: expr.startPosition.row,
++            javaArgCount: countArgs(argsNode),
++        };
++        if (argsNode) {
++            base.signatureLine = argsNode.startPosition.row;
++            base.signatureColumn = argsNode.startPosition.column + 1;
++        }
++        if (expr.type === 'method_invocation') {
++            const methodName = nameNode.text;
++            const types = receiverTypes(expr.childForFieldName('object'), ownerTypes, ownerDecl);
++            return {
++                ...base,
++                // Report the name node's line so chained calls point at the right line.
++                line: nameNode.startPosition.row,
++                calleeName: types && types[0] ? `${types[0]}.${methodName}` : methodName,
++                symbolLine: nameNode.startPosition.row,
++                symbolColumn: nameNode.startPosition.column,
++                javaMethodName: methodName,
++                javaReceiverTypes: types ? types.filter(Boolean) : null,
++            };
++        }
++        if (expr.type === 'object_creation_expression') {
++            // Anonymous class bodies are their own scope; still a constructor call of the base type.
++            const typeName = simpleType(nameNode.text);
++            return {
++                ...base,
++                calleeName: `new ${typeName}`,
++                symbolLine: nameNode.startPosition.row,
++                symbolColumn: nameNode.startPosition.column,
++                javaMethodName: '<init>',
++                javaReceiverTypes: [typeName],
++            };
++        }
++        if (expr.type === 'explicit_constructor_invocation') {
++            const ctor = expr.childForFieldName('constructor');
++            const types = ctor?.type === 'super' ? getSupertypes(ownerDecl).slice(0, 1) : ownerTypes.slice(0, 1);
++            if (types.length === 0)
++                return null;
++            return {
++                ...base,
++                calleeName: `new ${types[0]}`,
++                javaMethodName: '<init>',
++                javaReceiverTypes: types,
++            };
++        }
++        if (expr.type === 'method_reference') {
++            // Children: <receiver> '::' (identifier | 'new')
++            const children = expr.children;
++            const receiver = expr.namedChildren[0];
++            const last = children[children.length - 1];
++            if (!receiver || !last)
++                return null;
++            const isCtor = last.type === 'new';
++            const methodName = isCtor ? '<init>' : last.text;
++            let types;
++            if (isCtor || receiver.type === 'type_identifier' || receiver.type === 'scoped_type_identifier' || receiver.type === 'generic_type') {
++                types = [simpleType(receiver.text)];
++            }
++            else {
++                types = receiverTypes(receiver, ownerTypes, ownerDecl);
++            }
++            return {
++                ...base,
++                javaArgCount: -1,
++                calleeName: isCtor ? `new ${types?.[0]}` : (types && types[0] ? `${types[0]}.${methodName}` : methodName),
++                callType: 'ref',
++                isRef: true,
++                symbolLine: last.startPosition.row,
++                symbolColumn: last.startPosition.column,
++                javaMethodName: methodName,
++                javaReceiverTypes: types ? types.filter(Boolean) : null,
++            };
++        }
++        return null;
++    }
++};
+diff --git a/dist/analyzer/languages/python.js b/dist/analyzer/languages/python.js
+index fdd891f7420c86c552eda4d79169a1a61ebfe396..39078eee463d0dacd6908539925200bffe623c7c 100644
+--- a/dist/analyzer/languages/python.js
++++ b/dist/analyzer/languages/python.js
+@@ -14,6 +14,14 @@ function extractFunctionRef(node) {
+     }
+     return null;
+ }
++/** Preserve a qualified reference for external leaf nodes (e.g. cv2.imdecode). */
++function extractQualifiedFunctionRef(node) {
++    if (!node)
++        return null;
++    if (node.type === 'identifier' || node.type === 'attribute')
++        return node.text;
++    return null;
++}
+ /** Get the function reference from a keyword argument by keyword name. */
+ function getKeywordArgRef(argsNode, keyword) {
+     if (!argsNode)
+@@ -223,12 +231,40 @@ exports.pythonAnalyzer = {
+                 return { callerFilePath: filePath, calleeName: ref, line: callNode.startPosition.row, callType: 'concurrent', isRef: true };
+             }
+         }
++        // Starlette/FastAPI run_in_threadpool(fn, ...)
++        if (calleeName === 'run_in_threadpool') {
++            const ref = getPositionalArgRef(argsNode, 0) || getKeywordArgRef(argsNode, 'func');
++            if (ref) {
++                const positionalNode = argsNode?.namedChildren.find((child) => child.type !== 'keyword_argument');
++                const keywordNode = argsNode?.namedChildren.find((child) => child.type === 'keyword_argument' && child.childForFieldName('name')?.text === 'func')?.childForFieldName('value');
++                const qualifiedCalleeName = extractQualifiedFunctionRef(positionalNode || keywordNode);
++                return {
++                    callerFilePath: filePath,
++                    calleeName: ref,
++                    line: callNode.startPosition.row,
++                    callType: 'concurrent',
++                    isRef: true,
++                    symbolLine: (positionalNode || keywordNode)?.startPosition.row,
++                    symbolColumn: (positionalNode || keywordNode)?.startPosition.column,
++                    ...(qualifiedCalleeName && qualifiedCalleeName.includes('.') ? { qualifiedCalleeName } : {})
++                };
++            }
++        }
+         // Calls inside asyncio.gather() or asyncio.create_task() are concurrent
+         let callType;
+         if (isInsideAsyncioGather(callNode) || isArgumentToCreateTask(callNode)) {
+             callType = 'concurrent';
+         }
+         const result = { callerFilePath: filePath, calleeName, line: callNode.startPosition.row };
++        if (argsNode) {
++            result.signatureLine = argsNode.startPosition.row;
++            result.signatureColumn = argsNode.startPosition.column + 1;
++        }
++        result.symbolLine = nameNode.startPosition.row;
++        result.symbolColumn = nameNode.startPosition.column;
++        if (isMethodCall) {
++            result.qualifiedCalleeName = nameNode.text;
++        }
+         if (callType)
+             result.callType = callType;
+         return result;
+diff --git a/dist/index.local.js b/dist/index.local.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..aaeb94cac74b7261323978700c7bea2f600c6ba8
+--- /dev/null
++++ b/dist/index.local.js
+@@ -0,0 +1,12 @@
++"use strict";
++
++// Local patch entry point: use the package's readable CommonJS modules so
++// local analyzer fixes do not have to modify the minified bundle.
++module.exports = {
++    ...require("./types"),
++    ...require("./analyzer/treeSitter"),
++    ...require("./analyzer/index"),
++    ...require("./graph/callGraphBuilder"),
++    ...require("./graph/entryPointDetector"),
++    ...require("./graph/flowPartitioner"),
++};
+diff --git a/package.json b/package.json
+index 594a53131244dea9e8c678b02ef32901c8581fb4..0fab1e9014374e355255eb32c1693c7d45aeed56 100644
+--- a/package.json
++++ b/package.json
+@@ -22,7 +22,7 @@
+     "directory": "packages/core"
+   },
+   "homepage": "https://github.com/devricky-codes/callsight-vscode#readme",
+-  "main": "dist/index.js",
++  "main": "dist/index.local.js",
+   "types": "dist/index.d.ts",
+   "files": [
+     "dist/",

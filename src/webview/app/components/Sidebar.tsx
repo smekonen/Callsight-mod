@@ -1,6 +1,7 @@
 import React, { useState, useMemo } from 'react';
 import { Graph, DiffGraph } from '@codeflow-map/core';
-import { GraphAnalysisState } from '../App';
+import type { CanvasViewMode, GraphAnalysisState } from '../App';
+import type { TreeOrientation } from './TreeCanvas';
 
 type SidebarTab = 'analysis' | 'flows' | 'functions';
 
@@ -14,6 +15,8 @@ interface SidebarProps {
   setSelectedFlows: React.Dispatch<React.SetStateAction<Set<string>>>;
   blacklist: string[];
   setBlacklist: React.Dispatch<React.SetStateAction<string[]>>;
+  signatureTimeoutSeconds: number;
+  setSignatureTimeoutSeconds: React.Dispatch<React.SetStateAction<number>>;
   isLargeGraph: boolean;
   focusedNodeId: string | null;
   setFocusedNodeId: React.Dispatch<React.SetStateAction<string | null>>;
@@ -26,11 +29,22 @@ interface SidebarProps {
   onExitDiffMode: () => void;
   diffGraph: DiffGraph | null;
   mode: 'workspace' | 'file';
+  viewMode: CanvasViewMode;
+  setViewMode: React.Dispatch<React.SetStateAction<CanvasViewMode>>;
+  treeOrientation: TreeOrientation;
+  setTreeOrientation: React.Dispatch<React.SetStateAction<TreeOrientation>>;
+  showExternalFunctions: boolean;
+  setShowExternalFunctions: React.Dispatch<React.SetStateAction<boolean>>;
+  showFunctionCode: boolean;
+  setShowFunctionCode: React.Dispatch<React.SetStateAction<boolean>>;
+  codeFontSize: number;
+  setCodeFontSize: React.Dispatch<React.SetStateAction<number>>;
 }
 
-export default function Sidebar({ graph, searchQuery, onSearchChange, analysisState, setAnalysisState, selectedFlows, setSelectedFlows, blacklist, setBlacklist, isLargeGraph, focusedNodeId, setFocusedNodeId, isDiffMode, diffLoading, diffProgress, diffError, gitAvailable, onRequestDiffCompare, onExitDiffMode, diffGraph, mode }: SidebarProps) {
+export default function Sidebar({ graph, searchQuery, onSearchChange, analysisState, setAnalysisState, selectedFlows, setSelectedFlows, blacklist, setBlacklist, signatureTimeoutSeconds, setSignatureTimeoutSeconds, isLargeGraph, focusedNodeId, setFocusedNodeId, isDiffMode, diffLoading, diffProgress, diffError, gitAvailable, onRequestDiffCompare, onExitDiffMode, diffGraph, mode, viewMode, setViewMode, treeOrientation, setTreeOrientation, showExternalFunctions, setShowExternalFunctions, showFunctionCode, setShowFunctionCode, codeFontSize, setCodeFontSize }: SidebarProps) {
   const [activeTab, setActiveTab] = useState<SidebarTab>('analysis');
   const [localBlacklist, setLocalBlacklist] = useState(blacklist.join('\n'));
+  const [localSignatureTimeout, setLocalSignatureTimeout] = useState(String(signatureTimeoutSeconds));
   const [flowSearch, setFlowSearch] = useState('');
   const [functionSearch, setFunctionSearch] = useState('');
   const [diffHashA, setDiffHashA] = useState('');
@@ -39,10 +53,15 @@ export default function Sidebar({ graph, searchQuery, onSearchChange, analysisSt
   const [multiSelectFunctions, setMultiSelectFunctions] = useState(false);
   const [sortFlowsAlpha, setSortFlowsAlpha] = useState(false);
   const [sortFunctionsAlpha, setSortFunctionsAlpha] = useState(false);
+  const [isCollapsed, setIsCollapsed] = useState(false);
 
   React.useEffect(() => {
     setLocalBlacklist(blacklist.join('\n'));
   }, [blacklist]);
+
+  React.useEffect(() => {
+    setLocalSignatureTimeout(String(signatureTimeoutSeconds));
+  }, [signatureTimeoutSeconds]);
 
   const uniqueNodes = Array.from(new Map(graph.nodes.map((n: any) => [n.id, n])).values());
 
@@ -82,6 +101,9 @@ export default function Sidebar({ graph, searchQuery, onSearchChange, analysisSt
     if (selectedFlows.size > 0) {
       setSelectedFlows(new Set());
     }
+    // The Functions-tab search filters the list; it should not leave the
+    // rest of the canvas dimmed after choosing a result.
+    onSearchChange('');
     if (multiSelectFunctions) {
       setFocusedNodeId(prev => prev === nodeId ? null : nodeId);
     } else {
@@ -91,8 +113,18 @@ export default function Sidebar({ graph, searchQuery, onSearchChange, analysisSt
 
   const applyBlacklist = () => {
     const list = localBlacklist.split('\n').map(s => s.trim()).filter(s => s);
+    const parsedTimeout = Number(localSignatureTimeout);
+    const timeout = Number.isFinite(parsedTimeout)
+      ? Math.min(60, Math.max(1, Math.round(parsedTimeout)))
+      : 5;
     setBlacklist(list);
-    window.vscode.postMessage({ type: 'UPDATE_BLACKLIST', blacklist: list });
+    setSignatureTimeoutSeconds(timeout);
+    setLocalSignatureTimeout(String(timeout));
+    window.vscode.postMessage({
+      type: 'UPDATE_SCAN_SETTINGS',
+      blacklist: list,
+      signatureTimeoutSeconds: timeout,
+    });
   };
 
   const uniqueFlows = Array.from(new Map(graph.flows.map((f: any) => [f.id, f])).values());
@@ -178,10 +210,10 @@ export default function Sidebar({ graph, searchQuery, onSearchChange, analysisSt
     return uniqueNodes.filter((n: any) => orphanSet.has(n.id));
   }, [graph.orphans, uniqueNodes]);
 
-  // Also propagate the function search to the global search used by FlowCanvas
+  // This search filters the sidebar list only.
   const handleFunctionSearch = (val: string) => {
     setFunctionSearch(val);
-    onSearchChange(val);
+    onSearchChange('');
   };
 
   const inputStyle: React.CSSProperties = {
@@ -205,9 +237,36 @@ export default function Sidebar({ graph, searchQuery, onSearchChange, analysisSt
     </div>
   ) : null;
 
+  if (isCollapsed) {
+    return (
+      <div style={{
+        position: 'relative', width: 0, flexShrink: 0, height: '100%',
+        overflow: 'visible', zIndex: 30,
+      }}>
+        <button
+          type="button"
+          onClick={() => setIsCollapsed(false)}
+          title="Expand CallSight sidebar"
+          aria-label="Expand CallSight sidebar"
+          style={{
+            position: 'absolute', top: '8px', left: '8px',
+            width: '28px', height: '28px', padding: 0,
+            border: '1px solid var(--vscode-widget-border)', borderRadius: '4px',
+            background: 'var(--vscode-editorWidget-background)',
+            color: 'var(--vscode-button-secondaryForeground)', cursor: 'pointer',
+            boxShadow: '0 2px 8px rgba(0,0,0,0.28)', fontSize: '17px', lineHeight: 1,
+          }}
+        >
+          ›
+        </button>
+      </div>
+    );
+  }
+
   return (
     <div style={{
       width: '280px',
+      flexShrink: 0,
       background: 'var(--vscode-sideBar-background)',
       borderRight: '1px solid var(--vscode-sideBar-border)',
       display: 'flex',
@@ -217,7 +276,22 @@ export default function Sidebar({ graph, searchQuery, onSearchChange, analysisSt
     }}>
       {/* Header */}
       <div style={{ padding: '12px 16px 0', borderBottom: '1px solid var(--vscode-sideBarSectionHeader-border)' }}>
-        <h2 style={{ fontSize: '11px', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '1px', margin: '0 0 10px 0', color: 'var(--vscode-sideBarTitle-foreground)' }}>CallSight</h2>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
+          <h2 style={{ fontSize: '11px', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '1px', margin: 0, color: 'var(--vscode-sideBarTitle-foreground)' }}>CallSight</h2>
+          <button
+            type="button"
+            onClick={() => setIsCollapsed(true)}
+            title="Collapse CallSight sidebar"
+            aria-label="Collapse CallSight sidebar"
+            style={{
+              width: '24px', height: '22px', padding: 0, border: 'none', borderRadius: '3px',
+              background: 'transparent', color: 'var(--vscode-sideBar-foreground)',
+              cursor: 'pointer', fontSize: '17px', lineHeight: 1,
+            }}
+          >
+            ‹
+          </button>
+        </div>
         {/* Tabs */}
         <div className="sidebar-tabs">
           {(['analysis', 'flows', 'functions'] as SidebarTab[]).map(tab => (
@@ -272,6 +346,18 @@ export default function Sidebar({ graph, searchQuery, onSearchChange, analysisSt
                     marginBottom: '4px'
                   }}
                 />
+                <label style={{ display: 'block', fontSize: '11px', margin: '8px 0 4px', color: 'var(--vscode-descriptionForeground)' }}>
+                  Signature timeout (seconds)
+                </label>
+                <input
+                  type="number"
+                  min={1}
+                  max={60}
+                  step={1}
+                  value={localSignatureTimeout}
+                  onChange={e => setLocalSignatureTimeout(e.target.value)}
+                  style={{ ...inputStyle, marginBottom: '8px' }}
+                />
                 <button
                   onClick={applyBlacklist}
                   style={{ width: '100%', padding: '4px 0', background: 'var(--vscode-button-background)', color: 'var(--vscode-button-foreground)', border: 'none', borderRadius: '2px', cursor: 'pointer' }}
@@ -283,9 +369,92 @@ export default function Sidebar({ graph, searchQuery, onSearchChange, analysisSt
 
             <div style={{ marginBottom: '24px' }}>
               <h3 style={{ fontSize: '11px', fontWeight: 600, textTransform: 'uppercase', margin: '0 0 8px 0', color: 'var(--vscode-sideBarTitle-foreground)' }}>
+                Display
+              </h3>
+
+              <label style={{ display: 'block', fontSize: '10px', marginBottom: '4px', color: 'var(--vscode-descriptionForeground)' }}>
+                View
+              </label>
+              <div style={{ display: 'flex', gap: '2px', padding: '2px', marginBottom: '10px', borderRadius: '5px', background: 'var(--vscode-input-background)' }}>
+                {(['tree', 'graph'] as CanvasViewMode[]).map(candidate => (
+                  <button
+                    key={candidate}
+                    type="button"
+                    onClick={() => {
+                      setViewMode(candidate);
+                      setFocusedNodeId(null);
+                    }}
+                    style={{
+                      flex: 1, border: 'none', borderRadius: '4px', padding: '5px 9px', cursor: 'pointer',
+                      background: viewMode === candidate ? 'var(--vscode-button-background)' : 'transparent',
+                      color: viewMode === candidate ? 'var(--vscode-button-foreground)' : 'var(--vscode-editor-foreground)',
+                      fontSize: '11px', fontWeight: 600, textTransform: 'capitalize',
+                    }}
+                  >
+                    {candidate}
+                  </button>
+                ))}
+              </div>
+
+              {viewMode === 'tree' && (
+                <>
+                  <label style={{ display: 'block', fontSize: '10px', marginBottom: '4px', color: 'var(--vscode-descriptionForeground)' }}>
+                    Direction
+                  </label>
+                  <div style={{ display: 'flex', gap: '2px', padding: '2px', marginBottom: '10px', borderRadius: '5px', background: 'var(--vscode-input-background)' }}>
+                    {([['TB', 'Top-down'], ['LR', 'Left-right']] as Array<[TreeOrientation, string]>).map(([orientation, label]) => (
+                      <button
+                        key={orientation}
+                        type="button"
+                        onClick={() => setTreeOrientation(orientation)}
+                        style={{
+                          flex: 1, border: 'none', borderRadius: '4px', padding: '5px 5px', cursor: 'pointer',
+                          background: treeOrientation === orientation ? 'var(--vscode-button-background)' : 'transparent',
+                          color: treeOrientation === orientation ? 'var(--vscode-button-foreground)' : 'var(--vscode-editor-foreground)',
+                          fontSize: '11px', fontWeight: 600,
+                        }}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </>
+              )}
+
+              <label style={{ display: 'block', fontSize: '10px', marginBottom: '4px', color: 'var(--vscode-descriptionForeground)' }}>
+                External functions
+              </label>
+              <div style={{ display: 'flex', gap: '2px', padding: '2px', borderRadius: '5px', background: 'var(--vscode-input-background)' }}>
+                {([true, false] as const).map(shown => (
+                  <button
+                    key={String(shown)}
+                    type="button"
+                    onClick={() => setShowExternalFunctions(shown)}
+                    style={{
+                      flex: 1, border: 'none', borderRadius: '4px', padding: '5px 9px', cursor: 'pointer',
+                      background: showExternalFunctions === shown ? 'var(--vscode-button-background)' : 'transparent',
+                      color: showExternalFunctions === shown ? 'var(--vscode-button-foreground)' : 'var(--vscode-editor-foreground)',
+                      fontSize: '11px', fontWeight: 600,
+                    }}
+                    title={`${shown ? 'Show' : 'Hide'} external library functions`}
+                  >
+                    {shown ? 'Shown' : 'Hidden'}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div style={{ marginBottom: '24px' }}>
+              <h3 style={{ fontSize: '11px', fontWeight: 600, textTransform: 'uppercase', margin: '0 0 8px 0', color: 'var(--vscode-sideBarTitle-foreground)' }}>
                 Graph Analysis
               </h3>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', fontSize: '13px' }}>
+              {viewMode === 'tree' && (
+                <div style={{ fontSize: '11px', opacity: 0.65, marginBottom: '8px' }}>
+                  These controls are available in Graph view.
+                </div>
+              )}
+              <fieldset disabled={viewMode === 'tree'} style={{ border: 0, padding: 0, margin: 0, width: '100%', opacity: viewMode === 'tree' ? 0.45 : 1 }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', fontSize: '13px' }}>
                 <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
                   <input type="checkbox" checked={analysisState.heatmap} onChange={() => toggleFeature('heatmap')} />
                   Coupling Heatmap
@@ -330,7 +499,49 @@ export default function Sidebar({ graph, searchQuery, onSearchChange, analysisSt
                   <input type="checkbox" checked={analysisState.moduleClustering} onChange={() => toggleFeature('moduleClustering')} />
                   Module Clusters
                 </label>
-              </div>
+                </div>
+              </fieldset>
+            </div>
+
+            <div style={{ marginBottom: '24px' }}>
+              <h3 style={{ fontSize: '11px', fontWeight: 600, textTransform: 'uppercase', margin: '0 0 8px 0', color: 'var(--vscode-sideBarTitle-foreground)' }}>
+                Tree Code
+              </h3>
+              {viewMode === 'graph' && (
+                <div style={{ fontSize: '11px', opacity: 0.65, marginBottom: '8px' }}>
+                  Embedded code is available in Tree view.
+                </div>
+              )}
+              <fieldset disabled={viewMode === 'graph'} style={{ border: 0, padding: 0, margin: 0, width: '100%', opacity: viewMode === 'graph' ? 0.45 : 1 }}>
+                <div style={{ display: 'flex', gap: '2px', padding: '2px', marginBottom: '10px', borderRadius: '5px', background: 'var(--vscode-input-background)' }}>
+                  {([false, true] as const).map(shown => (
+                    <button
+                      key={String(shown)}
+                      type="button"
+                      onClick={() => setShowFunctionCode(shown)}
+                      style={{
+                        flex: 1, border: 'none', borderRadius: '4px', padding: '5px 9px', cursor: 'pointer',
+                        background: showFunctionCode === shown ? 'var(--vscode-button-background)' : 'transparent',
+                        color: showFunctionCode === shown ? 'var(--vscode-button-foreground)' : 'var(--vscode-editor-foreground)',
+                        fontSize: '11px', fontWeight: 600,
+                      }}
+                    >
+                      {shown ? 'All' : 'Hidden'}
+                    </button>
+                  ))}
+                </div>
+                <label style={{ display: 'flex', flexDirection: 'column', gap: '5px', fontSize: '11px' }}>
+                  <span>Font size: {codeFontSize}px</span>
+                  <input
+                    type="range"
+                    min={8}
+                    max={20}
+                    step={1}
+                    value={codeFontSize}
+                    onChange={event => setCodeFontSize(Number(event.target.value))}
+                  />
+                </label>
+              </fieldset>
             </div>
 
             {/* Git Diff Compare */}

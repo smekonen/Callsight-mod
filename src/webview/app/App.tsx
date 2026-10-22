@@ -1,8 +1,11 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import FlowCanvas from './components/FlowCanvas';
+import TreeCanvas, { TreeOrientation } from './components/TreeCanvas';
 import Sidebar from './components/Sidebar';
 import GraphLoader from './components/GraphLoader';
 import { Graph, DiffGraph } from '@codeflow-map/core';
+import { collectFunctionContext } from './graphContext';
+import type { FunctionComment } from '../../functionComments';
 
 export interface GraphAnalysisState {
   heatmap: boolean;
@@ -12,6 +15,8 @@ export interface GraphAnalysisState {
   complexityGlow: boolean;
   moduleClustering: boolean;
 }
+
+export type CanvasViewMode = 'graph' | 'tree';
 
 // Declare VS Code API interface
 declare global {
@@ -27,8 +32,17 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedFlows, setSelectedFlows] = useState<Set<string>>(new Set());
   const [blacklist, setBlacklist] = useState<string[]>([]);
+  const [signatureTimeoutSeconds, setSignatureTimeoutSeconds] = useState(5);
   const [focusedNodeId, setFocusedNodeId] = useState<string | null>(null);
   const [mode, setMode] = useState<'workspace' | 'file'>('workspace');
+  const [viewMode, setViewMode] = useState<CanvasViewMode>('tree');
+  const [treeOrientation, setTreeOrientation] = useState<TreeOrientation>('LR');
+  const [showExternalFunctions, setShowExternalFunctions] = useState(false);
+  const [showFunctionCode, setShowFunctionCode] = useState(true);
+  const [codeFontSize, setCodeFontSize] = useState(12);
+  const [functionSources, setFunctionSources] = useState<Record<string, string>>({});
+  const [functionComments, setFunctionComments] = useState<Record<string, FunctionComment>>({});
+  const requestedSourceIds = useRef(new Set<string>());
 
   // Diff state
   const [diffGraph, setDiffGraph] = useState<DiffGraph | null>(null);
@@ -61,8 +75,14 @@ export default function App() {
         (window as any).__graphMeta = message.meta;
         (window as any).__graphFlows = message.flows;
         (window as any).__graphOrphans = message.orphans;
+        requestedSourceIds.current.clear();
+        setFunctionSources({});
+        setFunctionComments({});
         if (message.callsightConfig?.blacklist) {
           setBlacklist(message.callsightConfig.blacklist);
+        }
+        if (typeof message.callsightConfig?.signatureTimeoutSeconds === 'number') {
+          setSignatureTimeoutSeconds(message.callsightConfig.signatureTimeoutSeconds);
         }
         if (message.mode) {
           setMode(message.mode);
@@ -100,9 +120,15 @@ export default function App() {
       if (message.type === 'LOAD_GRAPH') {
         const { graph: loadedGraph, callsightConfig, mode: loadedMode } = message;
         setGraph(loadedGraph);
+        requestedSourceIds.current.clear();
+        setFunctionSources({});
+        setFunctionComments({});
         setScanProgress(null);
         if (callsightConfig?.blacklist) {
           setBlacklist(callsightConfig.blacklist);
+        }
+        if (typeof callsightConfig?.signatureTimeoutSeconds === 'number') {
+          setSignatureTimeoutSeconds(callsightConfig.signatureTimeoutSeconds);
         }
         if (loadedMode) {
           setMode(loadedMode);
@@ -115,6 +141,9 @@ export default function App() {
         setDiffProgress(message.message);
       }
       if (message.type === 'DIFF_RESULT') {
+        requestedSourceIds.current.clear();
+        setFunctionSources(message.diffGraph?.functionSources || {});
+        setFunctionComments(message.diffGraph?.functionComments || {});
         setDiffGraph(message.diffGraph);
         setIsDiffMode(true);
         setDiffLoading(false);
@@ -128,6 +157,26 @@ export default function App() {
       }
       if (message.type === 'SCAN_PROGRESS') {
         setScanProgress({ scannedFiles: message.scannedFiles, totalFiles: message.totalFiles });
+      }
+      if (message.type === 'FUNCTION_SOURCES' && Array.isArray(message.sources)) {
+        setFunctionSources(previous => {
+          const next = { ...previous };
+          for (const item of message.sources) {
+            if (typeof item?.id === 'string' && typeof item?.source === 'string') {
+              next[item.id] = item.source;
+            }
+          }
+          return next;
+        });
+        setFunctionComments(previous => {
+          const next = { ...previous };
+          for (const item of message.sources) {
+            if (typeof item?.id === 'string' && item.comment && typeof item.comment.text === 'string') {
+              next[item.id] = item.comment;
+            }
+          }
+          return next;
+        });
       }
     };
 
@@ -155,12 +204,16 @@ export default function App() {
   const exitDiffMode = () => {
     setIsDiffMode(false);
     setDiffGraph(null);
+    requestedSourceIds.current.clear();
+    setFunctionSources({});
+    setFunctionComments({});
     setDiffError(null);
     setDiffProgress('');
   };
 
   // In diff mode, use diffGraph; otherwise use regular graph
   const activeGraph = isDiffMode && diffGraph ? diffGraph : graph;
+  const effectiveViewMode: CanvasViewMode = viewMode;
 
   const isLargeGraph = activeGraph ? activeGraph.nodes.length > 500 : false;
   
@@ -172,35 +225,89 @@ export default function App() {
 
     const hasSelection = selectedFlows.size > 0 || focusedNodeId;
 
+    let selectedGraph: Graph | DiffGraph | null = null;
+
     // No selection: large graphs show empty, small graphs show full
     if (!hasSelection) {
-      return isLargeGraph ? null : activeGraph;
+      selectedGraph = isLargeGraph ? null : activeGraph;
+    } else {
+      const activeNodeIds = new Set<string>();
+      let focusedEdges: Set<any> | undefined;
+
+      if (selectedFlows.size > 0) {
+        activeGraph.flows.forEach(f => {
+          if (selectedFlows.has(f.id)) {
+            f.nodeIds.forEach(id => activeNodeIds.add(id));
+          }
+        });
+      }
+
+      if (focusedNodeId) {
+        const context = collectFunctionContext(focusedNodeId, activeGraph.edges);
+        context.nodeIds.forEach(id => activeNodeIds.add(id));
+        focusedEdges = context.edges;
+      }
+
+      const filteredNodes = activeGraph.nodes.filter(n => activeNodeIds.has(n.id));
+      const filteredEdges = activeGraph.edges.filter(e =>
+        activeNodeIds.has(e.from)
+        && activeNodeIds.has(e.to)
+        && (!focusedEdges || focusedEdges.has(e)),
+      );
+      const filteredFlows = activeGraph.flows.filter(f => selectedFlows.has(f.id));
+      selectedGraph = { ...activeGraph, nodes: filteredNodes, edges: filteredEdges, flows: filteredFlows };
     }
 
-    const activeNodeIds = new Set<string>();
+    if (!selectedGraph || showExternalFunctions) return selectedGraph;
 
-    if (selectedFlows.size > 0) {
-      activeGraph.flows.forEach(f => {
-        if (selectedFlows.has(f.id)) {
-          f.nodeIds.forEach(id => activeNodeIds.add(id));
-        }
+    const visibleNodeIds = new Set(selectedGraph.nodes.filter((node: any) => !node.isExternal).map(node => node.id));
+    return {
+      ...selectedGraph,
+      nodes: selectedGraph.nodes.filter(node => visibleNodeIds.has(node.id)),
+      edges: selectedGraph.edges.filter(edge => visibleNodeIds.has(edge.from) && visibleNodeIds.has(edge.to)),
+      flows: selectedGraph.flows
+        .map(flow => ({ ...flow, nodeIds: flow.nodeIds.filter(id => visibleNodeIds.has(id)) }))
+        .filter(flow => flow.nodeIds.length > 0),
+      orphans: selectedGraph.orphans.filter(id => visibleNodeIds.has(id)),
+    };
+  }, [activeGraph, isLargeGraph, selectedFlows, focusedNodeId, showExternalFunctions]);
+
+  useEffect(() => {
+    if (effectiveViewMode !== 'tree' || !showFunctionCode || !displayGraph) return;
+    const missingIds = displayGraph.nodes
+      .filter((node: any) => node.isExternal !== true)
+      .map(node => node.id)
+      .filter(id => functionSources[id] === undefined && !requestedSourceIds.current.has(id));
+    if (missingIds.length === 0) return;
+    missingIds.forEach(id => requestedSourceIds.current.add(id));
+    window.vscode.postMessage({ type: 'REQUEST_FUNCTION_SOURCES', nodeIds: missingIds });
+  }, [displayGraph, effectiveViewMode, showFunctionCode, functionSources]);
+
+  const focusFunction = (nodeId: string) => {
+    setSelectedFlows(new Set());
+    setFocusedNodeId(previous => previous === nodeId ? null : nodeId);
+  };
+
+  const setCanvasFocusedNodeId = (nodeId: string | null) => {
+    if (nodeId === null) {
+      setFocusedNodeId(null);
+    } else {
+      focusFunction(nodeId);
+    }
+  };
+
+  const triggerReanalysis = () => {
+    if (isDiffMode) exitDiffMode();
+    if (mode === 'file') {
+      window.vscode.postMessage({ type: 'REFRESH_CURRENT_FILE' });
+    } else {
+      window.vscode.postMessage({
+        type: 'UPDATE_SCAN_SETTINGS',
+        blacklist,
+        signatureTimeoutSeconds,
       });
     }
-
-    if (focusedNodeId) {
-      activeNodeIds.add(focusedNodeId);
-      activeGraph.edges.forEach(e => {
-        if (e.from === focusedNodeId) activeNodeIds.add(e.to);
-        if (e.to === focusedNodeId) activeNodeIds.add(e.from);
-      });
-    }
-
-    const filteredNodes = activeGraph.nodes.filter(n => activeNodeIds.has(n.id));
-    const filteredEdges = activeGraph.edges.filter(e => activeNodeIds.has(e.from) && activeNodeIds.has(e.to));
-    const filteredFlows = activeGraph.flows.filter(f => selectedFlows.has(f.id));
-
-    return { ...activeGraph, nodes: filteredNodes, edges: filteredEdges, flows: filteredFlows };
-  }, [activeGraph, isLargeGraph, selectedFlows, focusedNodeId]);
+  };
 
   if (!activeGraph) {
     return (
@@ -233,6 +340,8 @@ export default function App() {
         setSelectedFlows={setSelectedFlows}
         blacklist={blacklist}
         setBlacklist={setBlacklist}
+        signatureTimeoutSeconds={signatureTimeoutSeconds}
+        setSignatureTimeoutSeconds={setSignatureTimeoutSeconds}
         isLargeGraph={isLargeGraph}
         focusedNodeId={focusedNodeId}
         setFocusedNodeId={setFocusedNodeId}
@@ -245,8 +354,28 @@ export default function App() {
         onExitDiffMode={exitDiffMode}
         diffGraph={diffGraph}
         mode={mode}
+        viewMode={effectiveViewMode}
+        setViewMode={setViewMode}
+        treeOrientation={treeOrientation}
+        setTreeOrientation={setTreeOrientation}
+        showExternalFunctions={showExternalFunctions}
+        setShowExternalFunctions={setShowExternalFunctions}
+        showFunctionCode={showFunctionCode}
+        setShowFunctionCode={setShowFunctionCode}
+        codeFontSize={codeFontSize}
+        setCodeFontSize={setCodeFontSize}
       />
       <div style={{ flex: 1, position: 'relative' }}>
+        <button
+          type="button"
+          className="canvas-reload nodrag nopan"
+          style={{ top: !isDiffMode && graph?.scannedFiles === 1 && !singleFileBannerDismissed ? '58px' : undefined }}
+          onClick={triggerReanalysis}
+          title="Re-analyze"
+          aria-label="Re-analyze"
+        >
+          ↻
+        </button>
         {/* Diff loading overlay */}
         {diffLoading && (
           <div style={{
@@ -290,22 +419,34 @@ export default function App() {
         {!displayGraph && isLargeGraph && (
           <div style={{ position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', zIndex: 10, color: 'var(--vscode-editor-foreground)', textAlign: 'center' }}>
             <h2>Large Codebase Detected ({activeGraph.nodes.length} nodes)</h2>
-            <p>Please select one or more flows from the sidebar to render the graph.</p>
+            <p>Please select one or more flows from the sidebar to render this view.</p>
           </div>
         )}
-        {displayGraph && (
+        {displayGraph && effectiveViewMode === 'tree' && (
+          <TreeCanvas
+            graph={displayGraph}
+            searchQuery={searchQuery}
+            orientation={treeOrientation}
+            showCode={showFunctionCode}
+            codeFontSize={codeFontSize}
+            functionSources={functionSources}
+            functionComments={functionComments}
+            onFocusFunction={focusFunction}
+          />
+        )}
+        {displayGraph && effectiveViewMode === 'graph' && (
           <FlowCanvas 
             graph={displayGraph} 
             searchQuery={searchQuery} 
             analysisState={analysisState}
             focusedNodeId={focusedNodeId}
-            setFocusedNodeId={setFocusedNodeId}
+            setFocusedNodeId={setCanvasFocusedNodeId}
             isDiffMode={isDiffMode}
             diffGraph={isDiffMode ? diffGraph : null}
           />
         )}
         {/* Function focus hint */}
-        {focusedNodeId && !focusHintDismissed && (
+        {effectiveViewMode === 'graph' && focusedNodeId && !focusHintDismissed && (
           <div style={{
             position: 'absolute', bottom: 16, right: 16, zIndex: 10,
             maxWidth: '280px',
@@ -323,7 +464,7 @@ export default function App() {
             boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
           }}>
             <span style={{ opacity: 0.8 }}>
-              Showing the selected function and its direct callers &amp; callees. Other nodes are faded. Faded edges connect nodes outside this context.
+              Showing the selected function with all of its upstream callers and downstream callees.
             </span>
             <button
               onClick={() => setFocusHintDismissed(true)}

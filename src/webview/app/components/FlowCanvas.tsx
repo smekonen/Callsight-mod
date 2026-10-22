@@ -384,23 +384,6 @@ export default function FlowCanvas({ graph, searchQuery, analysisState, focusedN
   const clusterMap = useMemo(() => analysisState.moduleClustering ? computeModuleClusters(graph) : new Map(), [graph, analysisState.moduleClustering]);
 
   // ─── Focus (non-impact-radius) ─────
-  const { connectedNodeIds, connectedEdgeIds } = useMemo(() => {
-    if (!focusedNodeId || analysisState.impactRadius) return { connectedNodeIds: new Set(), connectedEdgeIds: new Set() };
-
-    const nodeIds = new Set<string>([focusedNodeId]);
-    const edgeIds = new Set<string>();
-
-    graph.edges.forEach((e: any, idx: number) => {
-      if (e.from === focusedNodeId || e.to === focusedNodeId) {
-        nodeIds.add(e.from);
-        nodeIds.add(e.to);
-        edgeIds.add(`e${idx}-${e.from}-${e.to}`);
-      }
-    });
-
-    return { connectedNodeIds: nodeIds, connectedEdgeIds: edgeIds };
-  }, [focusedNodeId, graph.edges, analysisState.impactRadius]);
-
   // ─── Compute display nodes ─────────
   const displayNodes = useMemo(() => {
     // Check which clusters have >1 node (cross-file groups)
@@ -415,8 +398,6 @@ export default function FlowCanvas({ graph, searchQuery, analysisState, focusedN
       // Impact radius on hover/focus
       if (impactTargetId && analysisState.impactRadius && impactResult) {
         opacity = impactResult.nodeIds.has(node.id) ? 1 : 0.15;
-      } else if (focusedNodeId && !analysisState.impactRadius) {
-        opacity = connectedNodeIds.has(node.id) ? 1 : 0.15;
       } 
       // Fallback to Search Highlight
       else if (searchQuery) {
@@ -485,7 +466,7 @@ export default function FlowCanvas({ graph, searchQuery, analysisState, focusedN
         style: { ...node.style, opacity, transition: 'opacity 0.2s ease-in-out' }
       };
     });
-  }, [nodes, focusedNodeId, hoveredNodeId, connectedNodeIds, searchQuery, analysisState, degreeMap, maxDegree, impactResult, impactTargetId, cycleResult, complexityMap, clusterMap, searchIsolatedResult, isDiffMode, diffGraph]);
+  }, [nodes, focusedNodeId, hoveredNodeId, searchQuery, analysisState, degreeMap, maxDegree, impactResult, impactTargetId, cycleResult, complexityMap, clusterMap, searchIsolatedResult, isDiffMode, diffGraph]);
 
   // ─── Compute display edges ─────────────
   const displayEdges = useMemo(() => {
@@ -501,8 +482,6 @@ export default function FlowCanvas({ graph, searchQuery, analysisState, focusedN
 
       if (impactTargetId && analysisState.impactRadius && impactResult) {
         opacity = impactResult.edgeIds.has(edge.id) ? 1 : 0.15;
-      } else if (focusedNodeId && !analysisState.impactRadius) {
-        opacity = connectedEdgeIds.has(edge.id) ? 1 : 0.15;
       }
 
       // Cycle edges
@@ -539,7 +518,7 @@ export default function FlowCanvas({ graph, searchQuery, analysisState, focusedN
         }
       };
     });
-  }, [edges, focusedNodeId, hoveredNodeId, connectedEdgeIds, analysisState, impactResult, impactTargetId, cycleResult, searchIsolatedResult, isDiffMode, diffGraph]);
+  }, [edges, focusedNodeId, hoveredNodeId, analysisState, impactResult, impactTargetId, cycleResult, searchIsolatedResult, isDiffMode, diffGraph]);
 
   return (
     <>

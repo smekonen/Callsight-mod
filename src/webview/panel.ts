@@ -3,6 +3,7 @@ import * as path from 'path';
 import { Graph } from '@codeflow-map/core';
 import { checkGitAvailable, validateCommitHash, computeFullGitDiff, analyzeFilePath } from '../extension';
 import { initTreeSitter } from '@codeflow-map/core';
+import { extractLeadingFunctionComment, FunctionComment } from '../functionComments';
 
 export let currentPanel: vscode.WebviewPanel | undefined;
 let currentWasmDir: string | undefined;
@@ -82,7 +83,7 @@ export function ensurePanel(context: vscode.ExtensionContext, wasmDir: string) {
   currentWasmDir = wasmDir;
 
   if (currentPanel) {
-    currentPanel.reveal(vscode.ViewColumn.Beside);
+    currentPanel.reveal(vscode.ViewColumn.Active);
     return;
   }
 
@@ -91,13 +92,14 @@ export function ensurePanel(context: vscode.ExtensionContext, wasmDir: string) {
   currentPanel = vscode.window.createWebviewPanel(
     'callsight',
     'CallSight',
-    vscode.ViewColumn.Beside,
+    vscode.ViewColumn.Active,
     {
       enableScripts: true,
       retainContextWhenHidden: true,
       localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'media')],
     }
   );
+  currentPanel.iconPath = vscode.Uri.joinPath(context.extensionUri, 'media', 'callsight-tab.svg');
 
   currentPanel.onDidDispose(() => {
     currentPanel = undefined;
@@ -118,16 +120,56 @@ function attachMessageHandler(context: vscode.ExtensionContext) {
       // the graph has already been posted — nothing to do here.
     }
 
-    if (msg.type === 'UPDATE_BLACKLIST') {
+    if (msg.type === 'UPDATE_SCAN_SETTINGS' || msg.type === 'UPDATE_BLACKLIST') {
       const config = vscode.workspace.getConfiguration('callsight');
       await config.update('exclude', msg.blacklist, vscode.ConfigurationTarget.Workspace);
-      vscode.commands.executeCommand('callsight.analyzeWorkspace');
+      const signatureTimeoutSeconds = typeof msg.signatureTimeoutSeconds === 'number'
+        ? Math.min(60, Math.max(1, Math.round(msg.signatureTimeoutSeconds)))
+        : 5;
+      vscode.commands.executeCommand('callsight.analyzeWorkspace', { signatureTimeoutSeconds });
     }
 
     if (msg.type === 'REFRESH_CURRENT_FILE') {
       if (currentFilePath && currentWasmDir) {
         analyzeFilePath(currentFilePath, currentWasmDir);
       }
+    }
+
+    if (msg.type === 'REQUEST_FUNCTION_SOURCES' && lastContext) {
+      const requestedIds = new Set<string>(Array.isArray(msg.nodeIds) ? msg.nodeIds : []);
+      const requestedNodes = lastContext.graph.nodes.filter(
+        (node: any) => requestedIds.has(node.id) && node.isExternal !== true,
+      );
+      const nodesByFile = new Map<string, any[]>();
+      for (const node of requestedNodes) {
+        const group = nodesByFile.get(node.filePath) || [];
+        group.push(node);
+        nodesByFile.set(node.filePath, group);
+      }
+
+      const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+      const sources: Array<{ id: string; source: string; comment?: FunctionComment }> = [];
+      await Promise.all([...nodesByFile.entries()].map(async ([filePath, nodes]) => {
+        try {
+          const absolutePath = path.isAbsolute(filePath) ? filePath : path.join(workspaceRoot, filePath);
+          const document = await vscode.workspace.openTextDocument(vscode.Uri.file(absolutePath));
+          const documentText = document.getText();
+          for (const node of nodes) {
+            const startLine = Math.min(Math.max(0, node.startLine), Math.max(0, document.lineCount - 1));
+            const endLine = Math.min(Math.max(startLine, node.endLine), Math.max(0, document.lineCount - 1));
+            const endCharacter = document.lineAt(endLine).text.length;
+            sources.push({
+              id: node.id,
+              source: document.getText(new vscode.Range(startLine, 0, endLine, endCharacter)),
+              comment: extractLeadingFunctionComment(documentText, node),
+            });
+          }
+        } catch {
+          // A file may have moved since the scan; omit it and keep the tree usable.
+        }
+      }));
+
+      currentPanel?.webview.postMessage({ type: 'FUNCTION_SOURCES', sources });
     }
 
     if (msg.type === 'EXPORT_GRAPH_JSON') {
@@ -206,7 +248,8 @@ export function openCallSightPanel(
   context: vscode.ExtensionContext,
   graph: Graph,
   wasmDir: string,
-  mode: 'workspace' | 'file' = 'workspace'
+  mode: 'workspace' | 'file' = 'workspace',
+  signatureTimeoutSeconds = 5,
 ) {
   currentWasmDir = wasmDir;
   lastContext = { context, graph, wasmDir, mode };
@@ -219,19 +262,18 @@ export function openCallSightPanel(
   const blacklist = config.get<string[]>('exclude') || [
     "node_modules", "dist", "build", ".git", "__pycache__", "*.test.*", "*.spec.*"
   ];
-
   if (currentPanel) {
     // Panel already exists (either pre-created by ensurePanel or from a previous run)
     attachMessageHandler(context); // no-op if already attached
-    postGraphToWebview(currentPanel, graph, { blacklist }, mode);
-    currentPanel.reveal(vscode.ViewColumn.Beside);
+    postGraphToWebview(currentPanel, graph, { blacklist, signatureTimeoutSeconds }, mode);
+    currentPanel.reveal(vscode.ViewColumn.Active);
   } else {
     ensurePanel(context, wasmDir);
     // Panel just created — webview will fire READY when loaded; send graph on READY
     // We patch the handler to send the graph on the first READY event
     const disposable = currentPanel!.webview.onDidReceiveMessage(msg => {
       if (msg.type === 'READY') {
-        if (currentPanel) postGraphToWebview(currentPanel, graph, { blacklist }, mode);
+        if (currentPanel) postGraphToWebview(currentPanel, graph, { blacklist, signatureTimeoutSeconds }, mode);
         disposable.dispose();
       }
     });
